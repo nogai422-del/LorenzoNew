@@ -153,3 +153,18 @@ async def inactivity_watcher(bot, admin_user_ids: list[int], botlog, sleep_secon
         except Exception as exc:
             await botlog(f"inactivity_watcher error: {exc}")
         await asyncio.sleep(max(10, int(sleep_seconds)))
+
+
+async def send_test_inactivity_alert(bot, recipient_id: int, chat_id: int) -> None:
+    """Отправляет безопасный тест только нажавшему админу, не меняя историю алертов."""
+    info = get_chat_info(chat_id) or {}
+    chat_title = info.get("title") or (f"@{info['username']}" if info.get("username") else str(chat_id))
+    text = (
+        "🧪 <b>Тестовое оповещение о неактиве</b>\n"
+        f"Чат: <b>{html.escape(chat_title)}</b>\n"
+        "Участник: <a href=\"tg://user?id=1\">Тестовый участник</a>\n"
+        "Причина: нет сообщений: <b>7 дн.</b>\n"
+        "Последнее сообщение: тестовая ссылка не создаётся\n\n"
+        "✅ Канал доставки оповещений работает. Это сообщение не записано в историю алертов."
+    )
+    await bot.send_message(recipient_id, text, parse_mode="HTML", disable_web_page_preview=True)

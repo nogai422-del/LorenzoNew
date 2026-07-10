@@ -214,13 +214,14 @@ def is_admin(user_id: int) -> bool:
 
 
 setup_members_panel(is_admin)
-setup_activity_panel(is_admin, lambda: list(ADMIN_USER_IDS), botlog)
 dp.message.outer_middleware(MembersTrackMiddleware())
 
 def can_edit_settings(user_id: int) -> bool:
     if user_id == OWNER_ID:
         return True
     return settings_data.get("allow_admins_edit", True)
+
+setup_activity_panel(is_admin, can_edit_settings, lambda: list(ADMIN_USER_IDS), lambda: OWNER_ID, botlog)
 
 def get_notify_admins() -> list[int]:
     return settings_data.get("notify_admins", []) or []
@@ -466,8 +467,7 @@ def admin_main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="👥 Админы"), KeyboardButton(text="🔔 Оповещения")],
-            [KeyboardButton(text="👥 Участники"), KeyboardButton(text="👀 Неактивные")],
-            [KeyboardButton(text="⏳ Неактивность")],
+            [KeyboardButton(text="👥 Участники"), KeyboardButton(text="📊 Активность чатов")],
             [KeyboardButton(text="🟢 Бот ON/OFF"), KeyboardButton(text="🏷️ Уровни 1/2/3")],
             [KeyboardButton(text="🕒 Время работы"), KeyboardButton(text="⏱️ Задержка")],
             [KeyboardButton(text="📝 Тексты"), KeyboardButton(text="🧾 Логи")],
@@ -504,18 +504,12 @@ async def global_admin_back(message: Message, state: FSMContext):
         await show_admin_menu(message, state)
 
 @router.message(Command("admin"))
+@router.message(Command("activity"))
 @router.message(F.text == BTN_ADMIN_PANEL)
 async def admin_open_panel(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return await message.reply("⛔ Нет доступа.")
     await show_admin_menu(message, state)
-
-# =========================
-# ОБРАБОТКА КНОПОК activity-router
-# =========================
-# activity_router уже обработает "⏳ Неактивность" и его кнопки.
-# "👀 Неактивные" — тоже можно оставить как отдельную кнопку,
-# но в activity_router сейчас оно называется "👀 Неактивные" — ок.
 
 # =========================
 # ДАЛЕЕ ВАШИ ОСТАЛЬНЫЕ АДМИН РАЗДЕЛЫ (как было)
