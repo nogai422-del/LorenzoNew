@@ -32,9 +32,10 @@ from db import (
     set_left,
     get_chat_settings,
     list_chat_ids_with_settings,
+    record_chat,
 )
 from inactivity import inactivity_watcher
-from admin_activity_panel import router as activity_router
+from admin_activity_panel import router as activity_router, setup_activity_panel
 
 # =========================
 # CONFIG
@@ -171,8 +172,16 @@ class TrackActivityMiddleware(BaseMiddleware):
                 user_name = event.from_user.full_name or str(user_id)
                 now_ts = int(time.time())
 
+                record_chat(
+                    chat_id, event.chat.title, getattr(event.chat, "username", None),
+                    event.chat.type, now_ts
+                )
                 ensure_chat_settings(chat_id)
-                upsert_message_activity(chat_id, user_id, user_name, now_ts)
+                upsert_message_activity(
+                    chat_id, user_id, user_name, now_ts,
+                    message_id=event.message_id,
+                    username=event.from_user.username,
+                )
 
         return await handler(event, data)
 
@@ -205,6 +214,7 @@ def is_admin(user_id: int) -> bool:
 
 
 setup_members_panel(is_admin)
+setup_activity_panel(is_admin, lambda: list(ADMIN_USER_IDS), botlog)
 dp.message.outer_middleware(MembersTrackMiddleware())
 
 def can_edit_settings(user_id: int) -> bool:
@@ -327,8 +337,15 @@ async def welcome_new_member(message: Message):
         if new_member.id == bot.id:
             continue
 
+        record_chat(
+            chat_id, message.chat.title, getattr(message.chat, "username", None),
+            message.chat.type, now_ts
+        )
         ensure_chat_settings(chat_id)
-        set_joined(chat_id, int(new_member.id), new_member.full_name, now_ts)
+        set_joined(
+            chat_id, int(new_member.id), new_member.full_name, now_ts,
+            username=new_member.username,
+        )
 
         if not is_time_active_now() or level_value() not in (1, 2, 3):
             continue

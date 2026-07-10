@@ -1,168 +1,240 @@
-# admin_activity_panel.py
+import html
 import re
 import time
+from typing import Callable, Optional
 
-from aiogram import Router
-from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-)
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
+from aiogram import F, Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from db import (
-    ensure_chat_settings,
-    get_chat_settings,
-    set_chat_settings,
-    get_inactive_members,
     clear_alerts_for_chat,
+    ensure_chat_settings,
+    get_alert_candidates,
+    get_chat_info,
+    get_chat_settings,
+    list_known_chats,
+    set_chat_settings,
 )
+from inactivity import build_message_url, check_chat_now, format_dt
 
 router = Router()
-
-BTN_INACTIVITY = "⏳ Неактивность"
-BTN_SET_DAYS = "📌 Порог (дни)"
-BTN_SET_INTERVAL = "🔁 Интервал (мин)"
-BTN_SHOW_INACTIVE = "👀 Неактивные"
-BTN_CHECK_NOW = "⚡ Проверить сейчас"
-BTN_CLEAR_ALERTS = "🧹 Сбросить алерты"
-BTN_BACK = "◀️ Назад"
-
-class InactivityStates(StatesGroup):
-    set_days = State()
-    set_interval = State()
+_ADMIN_CHECKER: Optional[Callable[[int], bool]] = None
+_ADMIN_IDS_PROVIDER: Optional[Callable[[], list[int]]] = None
+_BOTLOG = None
 
 
-def main_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_SET_DAYS), KeyboardButton(text=BTN_SET_INTERVAL)],
-            [KeyboardButton(text=BTN_SHOW_INACTIVE), KeyboardButton(text=BTN_CHECK_NOW)],
-            [KeyboardButton(text=BTN_CLEAR_ALERTS)],
-            [KeyboardButton(text=BTN_BACK)],
-        ],
-        resize_keyboard=True
+def setup_activity_panel(admin_checker: Callable[[int], bool], admin_ids_provider: Callable[[], list[int]], botlog):
+    global _ADMIN_CHECKER, _ADMIN_IDS_PROVIDER, _BOTLOG
+    _ADMIN_CHECKER = admin_checker
+    _ADMIN_IDS_PROVIDER = admin_ids_provider
+    _BOTLOG = botlog
+
+
+def _is_admin(user_id: int) -> bool:
+    try:
+        return bool(_ADMIN_CHECKER and _ADMIN_CHECKER(int(user_id)))
+    except Exception:
+        return False
+
+
+class ActivityStates(StatesGroup):
+    value = State()
+
+
+def _chat_label(row) -> str:
+    title = row["title"] or (f"@{row['username']}" if row["username"] else str(row["chat_id"]))
+    return title[:45]
+
+
+def chats_keyboard() -> InlineKeyboardMarkup:
+    rows = list_known_chats()
+    buttons = [[InlineKeyboardButton(
+        text=("✅ " if int(row["enabled"]) else "⏸ ") + _chat_label(row),
+        callback_data=f"act:chat:{int(row['chat_id'])}",
+    )] for row in rows[:80]]
+    if not buttons:
+        buttons = [[InlineKeyboardButton(text="Чаты пока не обнаружены", callback_data="act:none")]]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def settings_keyboard(chat_id: int, enabled: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📆 Порог неактивности", callback_data=f"act:set:days:{chat_id}")],
+        [InlineKeyboardButton(text="🔄 Интервал проверки", callback_data=f"act:set:interval:{chat_id}")],
+        [InlineKeyboardButton(text="🔔 Повтор уведомлений", callback_data=f"act:set:repeat:{chat_id}")],
+        [InlineKeyboardButton(text="💬 Минимум сообщений", callback_data=f"act:set:messages:{chat_id}")],
+        [InlineKeyboardButton(text="⏸ Выключить" if enabled else "▶️ Включить", callback_data=f"act:toggle:{chat_id}")],
+        [InlineKeyboardButton(text="⚡ Проверить сейчас", callback_data=f"act:check:{chat_id}"),
+         InlineKeyboardButton(text="👥 Показать кандидатов", callback_data=f"act:list:{chat_id}")],
+        [InlineKeyboardButton(text="🧹 Сбросить алерты", callback_data=f"act:clear:{chat_id}")],
+        [InlineKeyboardButton(text="◀️ К выбору чата", callback_data="act:chats")],
+    ])
+
+
+def _settings_text(chat_id: int) -> str:
+    s = get_chat_settings(chat_id)
+    info = get_chat_info(chat_id) or {}
+    title = info.get("title") or (f"@{info['username']}" if info.get("username") else str(chat_id))
+    status = "включена" if s["enabled"] else "выключена"
+    minimum = str(s["min_message_count"]) if s["min_message_count"] else "отключено"
+    return (
+        f"⏳ <b>Проверка активности</b>\n\n"
+        f"Чат: <b>{html.escape(title)}</b>\n"
+        f"Проверка: <b>{status}</b>\n"
+        f"Порог отсутствия: <b>{s['inactivity_days']} дн.</b>\n"
+        f"Проверять каждые: <b>{s['check_interval_minutes']} мин.</b>\n"
+        f"Повторять алерт через: <b>{s['repeat_alert_hours']} ч.</b>\n"
+        f"Минимум сообщений: <b>{minimum}</b>\n\n"
+        "Проверка по количеству сообщений начинает действовать после того же периода, "
+        "который указан в пороге отсутствия. Значение 0 отключает её."
     )
 
 
-def back_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_BACK)]],
-        resize_keyboard=True
-    )
+async def _show_settings(target, chat_id: int):
+    ensure_chat_settings(chat_id)
+    s = get_chat_settings(chat_id)
+    text = _settings_text(chat_id)
+    kb = settings_keyboard(chat_id, bool(s["enabled"]))
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 @router.message(Command("activity"))
-async def open_activity_panel(message: Message, state: FSMContext):
-    """
-    Открывает панель. В main.py лучше ограничить права (ADMIN_USER_IDS).
-    """
-    chat_id = int(message.chat.id)
-    ensure_chat_settings(chat_id)
-
-    s = get_chat_settings(chat_id)
+async def activity_command(message: Message, state: FSMContext):
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return
     await state.clear()
-    await message.reply(
-        "⏳ <b>Настройки активности</b>\n\n"
-        f"Порог: <code>{s['inactivity_days']} дней</code>\n"
-        f"Интервал проверки: <code>{s['check_interval_minutes']} мин</code>\n",
-        reply_markup=main_kb(),
-        parse_mode="HTML",
+    await message.answer(
+        "Выберите чат, для которого нужно настроить проверку активности:",
+        reply_markup=chats_keyboard(),
     )
 
 
-@router.message(lambda m: m.text == BTN_BACK)
-async def close_panel(message: Message, state: FSMContext):
+@router.callback_query(F.data == "act:chats")
+async def back_to_chats(call: CallbackQuery, state: FSMContext):
+    if not _is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
     await state.clear()
-    await message.reply("Панель закрыта.", reply_markup=ReplyKeyboardRemove())
+    await call.message.edit_text("Выберите чат:", reply_markup=chats_keyboard())
+    await call.answer()
 
 
-@router.message(lambda m: m.text == BTN_SET_DAYS)
-async def set_days_prepare(message: Message, state: FSMContext):
-    chat_id = int(message.chat.id)
-    ensure_chat_settings(chat_id)
-
-    await state.set_state(InactivityStates.set_days)
-    await message.reply("Введи порог неактивности (1-3650 дней):", reply_markup=back_kb())
-
-
-@router.message(InactivityStates.set_days)
-async def set_days_finish(message: Message, state: FSMContext):
-    txt = (message.text or "").strip()
-    if not re.fullmatch(r"\d+", txt):
-        return await message.reply("Нужно число дней (пример: 3).", reply_markup=back_kb())
-
-    days = int(txt)
-    if not (1 <= days <= 3650):
-        return await message.reply("Диапазон: 1-3650.", reply_markup=back_kb())
-
-    chat_id = int(message.chat.id)
-    s = get_chat_settings(chat_id)
-    set_chat_settings(chat_id, inactivity_days=days, check_interval_minutes=s["check_interval_minutes"])
-
+@router.callback_query(F.data.startswith("act:chat:"))
+async def select_chat(call: CallbackQuery, state: FSMContext):
+    if not _is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    chat_id = int(call.data.rsplit(":", 1)[1])
     await state.clear()
-    s2 = get_chat_settings(chat_id)
-    await message.reply(f"✅ Порог обновлён: {s2['inactivity_days']} дней", reply_markup=main_kb())
+    await _show_settings(call, chat_id)
 
 
-@router.message(lambda m: m.text == BTN_SET_INTERVAL)
-async def set_interval_prepare(message: Message, state: FSMContext):
-    chat_id = int(message.chat.id)
-    ensure_chat_settings(chat_id)
-
-    await state.set_state(InactivityStates.set_interval)
-    await message.reply("Введи интервал проверки (1-1440 мин):", reply_markup=back_kb())
-
-
-@router.message(InactivityStates.set_interval)
-async def set_interval_finish(message: Message, state: FSMContext):
-    txt = (message.text or "").strip()
-    if not re.fullmatch(r"\d+", txt):
-        return await message.reply("Нужно число минут (пример: 60).", reply_markup=back_kb())
-
-    minutes = int(txt)
-    if not (1 <= minutes <= 1440):
-        return await message.reply("Диапазон: 1-1440.", reply_markup=back_kb())
-
-    chat_id = int(message.chat.id)
+@router.callback_query(F.data.startswith("act:toggle:"))
+async def toggle_chat(call: CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    chat_id = int(call.data.rsplit(":", 1)[1])
     s = get_chat_settings(chat_id)
-    set_chat_settings(chat_id, inactivity_days=s["inactivity_days"], check_interval_minutes=minutes)
+    set_chat_settings(chat_id, enabled=not bool(s["enabled"]), last_check_at=0)
+    await _show_settings(call, chat_id)
 
+
+_SET_PROMPTS = {
+    "days": ("inactivity_days", "Введите число дней от 1 до 3650:", 1, 3650),
+    "interval": ("check_interval_minutes", "Введите интервал проверки в минутах от 1 до 10080:", 1, 10080),
+    "repeat": ("repeat_alert_hours", "Через сколько часов повторять уведомление (1–8760):", 1, 8760),
+    "messages": ("min_message_count", "Введите минимум сообщений. 0 отключает эту проверку:", 0, 1_000_000),
+}
+
+
+@router.callback_query(F.data.startswith("act:set:"))
+async def prepare_value(call: CallbackQuery, state: FSMContext):
+    if not _is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    match = re.fullmatch(r"act:set:(days|interval|repeat|messages):(-?\d+)", call.data or "")
+    if not match:
+        return await call.answer("Некорректная команда", show_alert=True)
+    kind, chat_id_raw = match.groups()
+    field, prompt, minimum, maximum = _SET_PROMPTS[kind]
+    await state.set_state(ActivityStates.value)
+    await state.update_data(chat_id=int(chat_id_raw), field=field, minimum=minimum, maximum=maximum)
+    await call.message.answer(prompt)
+    await call.answer()
+
+
+@router.message(ActivityStates.value)
+async def save_value(message: Message, state: FSMContext):
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    text = (message.text or "").strip()
+    if not re.fullmatch(r"\d+", text):
+        return await message.answer("Нужно отправить целое неотрицательное число.")
+    value = int(text)
+    if not int(data["minimum"]) <= value <= int(data["maximum"]):
+        return await message.answer(f"Допустимый диапазон: {data['minimum']}–{data['maximum']}.")
+    chat_id = int(data["chat_id"])
+    set_chat_settings(chat_id, **{data["field"]: value}, last_check_at=0)
     await state.clear()
-    s2 = get_chat_settings(chat_id)
-    await message.reply(f"✅ Интервал обновлён: {s2['check_interval_minutes']} мин", reply_markup=main_kb())
+    await _show_settings(message, chat_id)
 
 
-@router.message(lambda m: m.text == BTN_SHOW_INACTIVE or m.text == BTN_CHECK_NOW)
-async def show_inactive(message: Message):
-    chat_id = int(message.chat.id)
-    ensure_chat_settings(chat_id)
-    s = get_chat_settings(chat_id)
-
-    now_ts = int(time.time())
-    rows = get_inactive_members(
-        chat_id=chat_id,
-        inactivity_days=s["inactivity_days"],
-        now_ts=now_ts,
-        limit=200,
-    )
-
-    if not rows:
-        return await message.reply("👀 Сейчас нет неактивных по текущему порогу.", reply_markup=main_kb())
-
-    lines = [f"👥 <b>Неактивные</b> (порог: {s['inactivity_days']} дней)"]
-    for r in rows:
-        uid = int(r["user_id"])
-        uname = r["user_name"] or str(uid)
-        last_ts = int(r["last_message_at"])
-        age_days = int((now_ts - last_ts) / 86400)
-        lines.append(f"• {uname} — {age_days} дней (last: {last_ts})")
-
-    await message.reply("\n".join(lines), reply_markup=main_kb(), parse_mode="HTML")
-
-
-@router.message(lambda m: m.text == BTN_CLEAR_ALERTS)
-async def clear_alerts(message: Message):
-    chat_id = int(message.chat.id)
+@router.callback_query(F.data.startswith("act:clear:"))
+async def clear_alerts(call: CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    chat_id = int(call.data.rsplit(":", 1)[1])
     clear_alerts_for_chat(chat_id)
-    await message.reply("🧹 Алерты для этого чата сброшены.", reply_markup=main_kb())
+    await call.answer("История уведомлений сброшена", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("act:check:"))
+async def run_check(call: CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    chat_id = int(call.data.rsplit(":", 1)[1])
+    await call.answer("Проверяю…")
+    count = await check_chat_now(
+        call.bot,
+        chat_id,
+        _ADMIN_IDS_PROVIDER() if _ADMIN_IDS_PROVIDER else [call.from_user.id],
+        _BOTLOG,
+        force=True,
+    )
+    await call.message.answer(f"Проверка завершена. Отправлено уведомлений: {count}.")
+
+
+@router.callback_query(F.data.startswith("act:list:"))
+async def list_candidates(call: CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    chat_id = int(call.data.rsplit(":", 1)[1])
+    s = get_chat_settings(chat_id)
+    now_ts = int(time.time())
+    rows = get_alert_candidates(chat_id, s["inactivity_days"], s["min_message_count"], now_ts, 100)
+    if not rows:
+        return await call.answer("Кандидатов сейчас нет", show_alert=True)
+    info = get_chat_info(chat_id) or {}
+    lines = ["👥 <b>Кандидаты на уведомление</b>"]
+    for row in rows:
+        name = html.escape(row["user_name"] or str(row["user_id"]))
+        url = build_message_url(chat_id, info.get("username"), row["last_message_id"])
+        last = format_dt(row["last_message_at"])
+        if url:
+            last = f'<a href="{url}">{last}</a>'
+        lines.append(f"• {name} — сообщений: {row['total_message_count']}; последнее: {last}")
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3880] + "…"
+    await call.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await call.answer()
+
+
+@router.callback_query(F.data == "act:none")
+async def no_chats(call: CallbackQuery):
+    await call.answer("Добавьте бота в группу и отправьте там сообщение", show_alert=True)
