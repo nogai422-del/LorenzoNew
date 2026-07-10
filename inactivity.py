@@ -24,6 +24,34 @@ def format_dt(ts: int | None) -> str:
     return datetime.fromtimestamp(int(ts)).strftime("%d.%m.%Y %H:%M")
 
 
+
+TELEGRAM_STATUS_LABELS = {
+    "online": "сейчас онлайн",
+    "offline": "точное время",
+    "recently": "был(а) недавно",
+    "last_week": "был(а) на этой неделе",
+    "last_month": "был(а) в этом месяце",
+    "long_ago": "был(а) давно",
+    "hidden": "скрыто",
+    "unknown": "неизвестно",
+}
+
+def effective_activity_ts(row) -> int:
+    return max(
+        int(row["last_message_at"] or 0),
+        int(row["telegram_last_seen_at"] or 0),
+        int(row["joined_at"] or 0),
+    )
+
+def format_telegram_status(row) -> str:
+    status = str(row["telegram_status"] or "unknown")
+    label = TELEGRAM_STATUS_LABELS.get(status, status)
+    ts = int(row["telegram_last_seen_at"] or 0)
+    if ts:
+        return f"{label}: {format_dt(ts)}"
+    return label
+
+
 def build_message_url(chat_id: int, chat_username: str | None, message_id: int | None) -> str | None:
     if not message_id:
         return None
@@ -111,7 +139,7 @@ async def check_chat_now(bot, chat_id: int, admin_user_ids: list[int], botlog, f
 
     for row in rows:
         user_id = int(row["user_id"])
-        last_activity = int(row["last_message_at"] or row["joined_at"] or 0)
+        last_activity = effective_activity_ts(row)
         inactive = bool(last_activity and last_activity <= threshold)
         low_messages = bool(
             int(settings["min_message_count"]) > 0
@@ -154,7 +182,8 @@ async def check_chat_now(bot, chat_id: int, admin_user_ids: list[int], botlog, f
             f"Чат: <b>{html.escape(chat_title)}</b>\n"
             f"Участник: {user_link}\n"
             f"Причина: {'; '.join(reasons)}\n"
-            f"Последнее сообщение: {last_line}"
+            f"Последнее сообщение: {last_line}\n"
+            f"Активность Telegram: {html.escape(format_telegram_status(row))}"
         )
 
         delivered = False

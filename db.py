@@ -52,6 +52,9 @@ def init_db():
                 left_at INTEGER,
                 last_message_at INTEGER,
                 last_message_id INTEGER,
+                telegram_last_seen_at INTEGER,
+                telegram_status TEXT,
+                telegram_status_checked_at INTEGER,
                 total_message_count INTEGER NOT NULL DEFAULT 0,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (chat_id, user_id)
@@ -81,6 +84,9 @@ def init_db():
         # Миграции старой базы.
         _add_column(conn, "chat_members", "username", "TEXT")
         _add_column(conn, "chat_members", "last_message_id", "INTEGER")
+        _add_column(conn, "chat_members", "telegram_last_seen_at", "INTEGER")
+        _add_column(conn, "chat_members", "telegram_status", "TEXT")
+        _add_column(conn, "chat_members", "telegram_status_checked_at", "INTEGER")
         _add_column(conn, "chat_settings", "repeat_alert_hours", "INTEGER NOT NULL DEFAULT 24")
         _add_column(conn, "chat_settings", "min_message_count", "INTEGER NOT NULL DEFAULT 0")
         _add_column(conn, "chat_settings", "enabled", "INTEGER NOT NULL DEFAULT 1")
@@ -218,7 +224,9 @@ def upsert_message_activity(chat_id: int, user_id: int, user_name: str, now_ts: 
 
 
 def import_member(chat_id: int, user_id: int, user_name: str | None, username: str | None,
-                  joined_at: int, message_count: int = 0):
+                  joined_at: int, message_count: int = 0,
+                  telegram_last_seen_at: int | None = None, telegram_status: str | None = None,
+                  telegram_status_checked_at: int | None = None):
     """Добавляет подтверждённого участника из внешнего списка без искусственного сообщения."""
     joined_at = max(0, int(joined_at))
     message_count = max(0, int(message_count or 0))
@@ -226,16 +234,27 @@ def import_member(chat_id: int, user_id: int, user_name: str | None, username: s
         conn.execute("""
             INSERT INTO chat_members(
                 chat_id, user_id, user_name, username, joined_at, left_at,
-                last_message_at, last_message_id, total_message_count, is_active
-            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, 1)
+                last_message_at, last_message_id, telegram_last_seen_at, telegram_status,
+                telegram_status_checked_at, total_message_count, is_active
+            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, 1)
             ON CONFLICT(chat_id, user_id) DO UPDATE SET
                 user_name=COALESCE(excluded.user_name, chat_members.user_name),
                 username=COALESCE(excluded.username, chat_members.username),
                 joined_at=COALESCE(chat_members.joined_at, excluded.joined_at),
+                telegram_last_seen_at=CASE
+                    WHEN excluded.telegram_last_seen_at IS NULL THEN chat_members.telegram_last_seen_at
+                    ELSE MAX(COALESCE(chat_members.telegram_last_seen_at, 0), excluded.telegram_last_seen_at)
+                END,
+                telegram_status=COALESCE(excluded.telegram_status, chat_members.telegram_status),
+                telegram_status_checked_at=COALESCE(excluded.telegram_status_checked_at, chat_members.telegram_status_checked_at),
                 total_message_count=MAX(chat_members.total_message_count, excluded.total_message_count),
                 left_at=NULL,
                 is_active=1
-        """, (int(chat_id), int(user_id), user_name, username, joined_at, message_count))
+        """, (int(chat_id), int(user_id), user_name, username, joined_at,
+              int(telegram_last_seen_at) if telegram_last_seen_at else None,
+              telegram_status,
+              int(telegram_status_checked_at) if telegram_status_checked_at else None,
+              message_count))
         conn.commit()
 
 def set_joined(chat_id: int, user_id: int, user_name: str, now_ts: int, username: str | None = None):
@@ -275,7 +294,8 @@ def list_active_members(chat_id: int, limit: int = 100000):
     with get_conn() as conn:
         return conn.execute("""
             SELECT user_id, user_name, username, joined_at, last_message_at,
-                   last_message_id, total_message_count
+                   last_message_id, telegram_last_seen_at, telegram_status,
+                   telegram_status_checked_at, total_message_count
             FROM chat_members
             WHERE chat_id=? AND is_active=1
             ORDER BY user_id
@@ -297,15 +317,16 @@ def get_alert_candidates(chat_id: int, inactivity_days: int, min_message_count: 
     with get_conn() as conn:
         return conn.execute("""
             SELECT user_id, user_name, username, joined_at, last_message_at,
-                   last_message_id, total_message_count
+                   last_message_id, telegram_last_seen_at, telegram_status,
+                   telegram_status_checked_at, total_message_count
             FROM chat_members
             WHERE chat_id=? AND is_active=1
               AND (
-                    (COALESCE(last_message_at, joined_at, 0) > 0
-                     AND COALESCE(last_message_at, joined_at, 0) <= ?)
+                    (MAX(COALESCE(last_message_at, 0), COALESCE(telegram_last_seen_at, 0), COALESCE(joined_at, 0)) > 0
+                     AND MAX(COALESCE(last_message_at, 0), COALESCE(telegram_last_seen_at, 0), COALESCE(joined_at, 0)) <= ?)
                  OR (? > 0 AND total_message_count < ? AND COALESCE(joined_at, 0) <= ?)
               )
-            ORDER BY COALESCE(last_message_at, joined_at, 0) ASC
+            ORDER BY MAX(COALESCE(last_message_at, 0), COALESCE(telegram_last_seen_at, 0), COALESCE(joined_at, 0)) ASC
             LIMIT ?
         """, (int(chat_id), threshold, int(min_message_count), int(min_message_count), threshold, int(limit))).fetchall()
 

@@ -346,7 +346,7 @@ async def list_candidates(call: CallbackQuery, state: FSMContext):
 
 
 def _normalise_import_rows(payload: bytes, filename: str) -> list[dict]:
-    """Читает CSV/JSON и возвращает строки с user_id, name, username, message_count."""
+    """Читает CSV/JSON, включая снимок последней активности из Telethon."""
     lower = (filename or "").lower()
     if lower.endswith(".json"):
         data = json.loads(payload.decode("utf-8-sig"))
@@ -371,6 +371,9 @@ def _normalise_import_rows(payload: bytes, filename: str) -> list[dict]:
         "name": ("name", "full_name", "user_name", "fullname"),
         "username": ("username", "user", "login"),
         "message_count": ("message_count", "messages", "total_message_count", "count"),
+        "telegram_last_seen_at": ("telegram_last_seen_at", "last_seen_at", "last_online_at"),
+        "telegram_status": ("telegram_status", "last_seen_status", "online_status"),
+        "telegram_status_checked_at": ("telegram_status_checked_at", "status_checked_at", "exported_at"),
     }
     result = []
     seen = set()
@@ -394,11 +397,20 @@ def _normalise_import_rows(payload: bytes, filename: str) -> list[dict]:
             message_count = max(0, int(values["message_count"] or 0))
         except (TypeError, ValueError):
             message_count = 0
+        def _optional_int(value):
+            try:
+                return int(value) if value not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
+
         result.append({
             "user_id": user_id,
             "name": name,
             "username": username,
             "message_count": message_count,
+            "telegram_last_seen_at": _optional_int(values.get("telegram_last_seen_at")),
+            "telegram_status": str(values.get("telegram_status") or "").strip() or None,
+            "telegram_status_checked_at": _optional_int(values.get("telegram_status_checked_at")),
         })
     return result
 
@@ -472,7 +484,12 @@ async def import_members_file(message: Message, state: FSMContext):
             name = row["name"] or user.full_name or str(user_id)
             username = row["username"] or user.username
             existed = get_chat_member_stats(chat_id, user_id) is not None
-            import_member(chat_id, user_id, name, username, now_ts, row["message_count"])
+            import_member(
+                chat_id, user_id, name, username, now_ts, row["message_count"],
+                telegram_last_seen_at=row.get("telegram_last_seen_at"),
+                telegram_status=row.get("telegram_status"),
+                telegram_status_checked_at=row.get("telegram_status_checked_at"),
+            )
             if import_known_member:
                 import_known_member(chat_id, user_id, name, username, user.is_bot, row["message_count"])
             bots += 1 if user.is_bot else 0
@@ -502,6 +519,7 @@ async def import_members_file(message: Message, state: FSMContext):
         f"Ботов в добавленных/обновлённых: <b>{bots}</b>\n"
         f"Ошибок Telegram API: <b>{errors}</b>\n\n"
         "Участники без истории сообщений добавлены с нулевым счётчиком. "
+        "Если CSV создан обновлённым Telethon-экспортёром, бот также сохранит доступный статус последнего онлайна. "
         "Ссылка на последнее сообщение появится после их первого нового сообщения.",
         parse_mode="HTML",
     )
