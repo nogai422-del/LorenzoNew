@@ -200,19 +200,19 @@ def record_member_join(
         conn.commit()
 
 
-def record_member_left(chat_id: int, user_id: int):
-    now = _now_ts()
-
+def remove_known_member(chat_id: int, user_id: int):
+    """Удаляет бывшего участника из списка известных участников."""
     with _connect() as conn:
         conn.execute(
-            """
-            UPDATE known_members
-            SET left_at = ?, last_seen_ts = ?
-            WHERE chat_id = ? AND user_id = ?
-            """,
-            (now, now, int(chat_id), int(user_id)),
+            "DELETE FROM known_members WHERE chat_id = ? AND user_id = ?",
+            (int(chat_id), int(user_id)),
         )
         conn.commit()
+
+
+def record_member_left(chat_id: int, user_id: int):
+    # Бывшие участники больше не должны отображаться в списках.
+    remove_known_member(chat_id, user_id)
 
 
 def list_internal_chats() -> list[sqlite3.Row]:

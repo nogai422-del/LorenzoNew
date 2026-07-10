@@ -247,6 +247,28 @@ def set_left(chat_id: int, user_id: int, now_ts: int):
     remove_member(chat_id, user_id)
 
 
+
+def list_active_members(chat_id: int, limit: int = 100000):
+    """Возвращает всех известных активных участников для сверки с Telegram."""
+    with get_conn() as conn:
+        return conn.execute("""
+            SELECT user_id, user_name, username, joined_at, last_message_at,
+                   last_message_id, total_message_count
+            FROM chat_members
+            WHERE chat_id=? AND is_active=1
+            ORDER BY user_id
+            LIMIT ?
+        """, (int(chat_id), int(limit))).fetchall()
+
+
+def count_active_members(chat_id: int) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM chat_members WHERE chat_id=? AND is_active=1",
+            (int(chat_id),),
+        ).fetchone()
+    return int(row["count"] or 0)
+
 def get_alert_candidates(chat_id: int, inactivity_days: int, min_message_count: int,
                          now_ts: int, limit: int = 500):
     threshold = int(now_ts) - int(inactivity_days) * 86400

@@ -15,13 +15,14 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile, ChatMemberUpdated
 )
 
 from members_panel import (
     router as members_router,
     setup_members_panel,
     MembersTrackMiddleware,
+    remove_known_member,
 )
 
 from db import (
@@ -30,6 +31,7 @@ from db import (
     upsert_message_activity,
     set_joined,
     set_left,
+    remove_member,
     get_chat_settings,
     list_chat_ids_with_settings,
     record_chat,
@@ -363,6 +365,21 @@ async def welcome_new_member(message: Message):
         await user_state.set_state(Onboarding.waiting_for_age)
         await message.reply(welcome_text)
 
+@router.chat_member()
+async def chat_member_updated_handler(event: ChatMemberUpdated):
+    """Удаляет из обеих баз участника сразу после выхода, кика или бана."""
+    try:
+        status = str(event.new_chat_member.status)
+        if status not in {"left", "kicked", "banned"}:
+            return
+        chat_id = int(event.chat.id)
+        user_id = int(event.new_chat_member.user.id)
+        remove_member(chat_id, user_id)
+        remove_known_member(chat_id, user_id)
+    except Exception as exc:
+        await botlog(f"chat_member cleanup error: {exc}")
+
+
 @router.message(F.left_chat_member)
 async def left_chat_member_handler(message: Message):
     try:
@@ -370,6 +387,7 @@ async def left_chat_member_handler(message: Message):
         now_ts = int(time.time())
         uid = int(message.left_chat_member.id)
         set_left(chat_id, uid, now_ts)
+        remove_known_member(chat_id, uid)
 
         # Убираем системное сообщение
         try:

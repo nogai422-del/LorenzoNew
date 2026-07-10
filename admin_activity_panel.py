@@ -17,7 +17,13 @@ from db import (
     list_known_chats,
     set_chat_settings,
 )
-from inactivity import build_message_url, check_chat_now, format_dt, send_test_inactivity_alert
+from inactivity import (
+    build_message_url,
+    check_chat_now,
+    format_dt,
+    send_test_inactivity_alert,
+    synchronize_chat_members,
+)
 
 router = Router()
 _ADMIN_CHECKER: Optional[Callable[[int], bool]] = None
@@ -99,6 +105,7 @@ def settings_keyboard(chat_id: int, enabled: bool, can_edit: bool) -> InlineKeyb
     rows.extend([
         [InlineKeyboardButton(text="⚡ Реальная проверка", callback_data=f"act:check:{chat_id}"),
          InlineKeyboardButton(text="👥 Кандидаты", callback_data=f"act:list:{chat_id}")],
+        [InlineKeyboardButton(text="🔄 Обновить базу участников", callback_data=f"act:sync:{chat_id}")],
         [InlineKeyboardButton(text="🧪 Тест оповещения", callback_data=f"act:test:{chat_id}")],
         [InlineKeyboardButton(text="◀️ К выбору чата", callback_data="act:chats")],
     ])
@@ -277,6 +284,23 @@ async def run_check(call: CallbackQuery, state: FSMContext):
         _BOTLOG, force=True,
     )
     await call.message.answer(f"Проверка завершена. Отправлено уведомлений: {count}.")
+
+
+@router.callback_query(F.data.startswith("act:sync:"))
+async def sync_members(call: CallbackQuery, state: FSMContext):
+    chat_id = int(call.data.rsplit(":", 1)[1])
+    if not await _validate_selected_chat(call, state, chat_id, require_edit=True):
+        return
+    await call.answer("Сверяю участников с Telegram…")
+    report = await synchronize_chat_members(call.bot, chat_id, _BOTLOG)
+    await call.message.answer(
+        "🔄 <b>База участников обновлена</b>\n\n"
+        f"Проверено через Telegram: <b>{report['checked']}</b>\n"
+        f"Удалено вышедших/забаненных: <b>{report['removed']}</b>\n"
+        f"Ошибок проверки: <b>{report['errors']}</b>\n"
+        f"Осталось в рабочей базе: <b>{report['active']}</b>",
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data.startswith("act:test:"))

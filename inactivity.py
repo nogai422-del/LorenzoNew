@@ -4,9 +4,11 @@ import time
 from datetime import datetime
 
 from db import (
+    count_active_members,
     get_alert_candidates,
     get_chat_info,
     get_chat_settings,
+    list_active_members,
     list_chat_ids_with_settings,
     mark_alert,
     mark_chat_checked,
@@ -33,13 +35,45 @@ def build_message_url(chat_id: int, chat_username: str | None, message_id: int |
     return None
 
 
-async def _is_still_member(bot, chat_id: int, user_id: int) -> bool:
+def _remove_from_all_databases(chat_id: int, user_id: int) -> None:
+    remove_member(chat_id, user_id)
     try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status not in {"left", "kicked"}
+        from members_panel import remove_known_member
+        remove_known_member(chat_id, user_id)
     except Exception:
-        # Ошибка API не должна удалять живого участника.
-        return True
+        # Вспомогательная панель может быть отключена; основная база всё равно очищена.
+        pass
+
+
+async def synchronize_chat_members(bot, chat_id: int, botlog=None) -> dict:
+    """Сверяет всех известных участников с Telegram и удаляет бывших из обеих баз."""
+    rows = list_active_members(chat_id)
+    checked = 0
+    removed = 0
+    errors = 0
+
+    for row in rows:
+        user_id = int(row["user_id"])
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            checked += 1
+            status = str(member.status)
+            if status in {"left", "kicked", "banned"}:
+                _remove_from_all_databases(chat_id, user_id)
+                removed += 1
+        except Exception as exc:
+            errors += 1
+            if botlog:
+                await botlog(f"member sync chat={chat_id} user={user_id} error: {exc}")
+        # Не создаём резкий всплеск запросов к Telegram API на больших чатах.
+        await asyncio.sleep(0.03)
+
+    return {
+        "checked": checked,
+        "removed": removed,
+        "errors": errors,
+        "active": count_active_members(chat_id),
+    }
 
 
 async def check_chat_now(bot, chat_id: int, admin_user_ids: list[int], botlog, force: bool = False) -> int:
@@ -63,6 +97,9 @@ async def check_chat_now(bot, chat_id: int, admin_user_ids: list[int], botlog, f
         chat_title = info.get("title") or (f"@{info['username']}" if info.get("username") else str(chat_id))
         chat_username = info.get("username")
 
+    # Перед поиском неактивов очищаем обе базы от уже вышедших/забаненных.
+    await synchronize_chat_members(bot, chat_id, botlog)
+
     rows = get_alert_candidates(
         chat_id=chat_id,
         inactivity_days=settings["inactivity_days"],
@@ -74,10 +111,6 @@ async def check_chat_now(bot, chat_id: int, admin_user_ids: list[int], botlog, f
 
     for row in rows:
         user_id = int(row["user_id"])
-        if not await _is_still_member(bot, chat_id, user_id):
-            remove_member(chat_id, user_id)
-            continue
-
         last_activity = int(row["last_message_at"] or row["joined_at"] or 0)
         inactive = bool(last_activity and last_activity <= threshold)
         low_messages = bool(
