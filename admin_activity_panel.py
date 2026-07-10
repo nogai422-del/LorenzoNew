@@ -1,4 +1,8 @@
+import asyncio
+import csv
 import html
+import io
+import json
 import re
 import time
 from typing import Awaitable, Callable, Optional
@@ -14,6 +18,7 @@ from db import (
     get_alert_candidates,
     get_chat_info,
     get_chat_settings,
+    import_member,
     list_known_chats,
     set_chat_settings,
 )
@@ -72,6 +77,7 @@ def _owner_id() -> int:
 class ActivityStates(StatesGroup):
     value = State()
     selected_chat = State()
+    import_file = State()
 
 
 def _chat_label(row) -> str:
@@ -106,6 +112,7 @@ def settings_keyboard(chat_id: int, enabled: bool, can_edit: bool) -> InlineKeyb
         [InlineKeyboardButton(text="⚡ Реальная проверка", callback_data=f"act:check:{chat_id}"),
          InlineKeyboardButton(text="👥 Кандидаты", callback_data=f"act:list:{chat_id}")],
         [InlineKeyboardButton(text="🔄 Обновить базу участников", callback_data=f"act:sync:{chat_id}")],
+        [InlineKeyboardButton(text="📥 Импорт участников", callback_data=f"act:import:{chat_id}")],
         [InlineKeyboardButton(text="🧪 Тест оповещения", callback_data=f"act:test:{chat_id}")],
         [InlineKeyboardButton(text="◀️ К выбору чата", callback_data="act:chats")],
     ])
@@ -335,6 +342,175 @@ async def list_candidates(call: CallbackQuery, state: FSMContext):
         text = text[:3880] + "…"
     await call.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
     await call.answer()
+
+
+
+def _normalise_import_rows(payload: bytes, filename: str) -> list[dict]:
+    """Читает CSV/JSON и возвращает строки с user_id, name, username, message_count."""
+    lower = (filename or "").lower()
+    if lower.endswith(".json"):
+        data = json.loads(payload.decode("utf-8-sig"))
+        if isinstance(data, dict):
+            data = data.get("members") or data.get("users") or data.get("data") or []
+        if not isinstance(data, list):
+            raise ValueError("JSON должен содержать массив участников")
+        raw_rows = data
+    elif lower.endswith(".csv"):
+        text = payload.decode("utf-8-sig")
+        sample = text[:4096]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        raw_rows = list(csv.DictReader(io.StringIO(text), dialect=dialect))
+    else:
+        raise ValueError("Поддерживаются только файлы CSV и JSON")
+
+    aliases = {
+        "user_id": ("user_id", "id", "telegram_id", "tg_id", "userid"),
+        "name": ("name", "full_name", "user_name", "fullname"),
+        "username": ("username", "user", "login"),
+        "message_count": ("message_count", "messages", "total_message_count", "count"),
+    }
+    result = []
+    seen = set()
+    for item in raw_rows:
+        if not isinstance(item, dict):
+            continue
+        normalized = {str(k).strip().lower(): v for k, v in item.items()}
+        values = {}
+        for target, names in aliases.items():
+            values[target] = next((normalized.get(n) for n in names if normalized.get(n) not in (None, "")), None)
+        try:
+            user_id = int(str(values["user_id"]).strip())
+        except (TypeError, ValueError):
+            continue
+        if user_id <= 0 or user_id in seen:
+            continue
+        seen.add(user_id)
+        username = str(values["username"] or "").strip().lstrip("@") or None
+        name = str(values["name"] or "").strip() or None
+        try:
+            message_count = max(0, int(values["message_count"] or 0))
+        except (TypeError, ValueError):
+            message_count = 0
+        result.append({
+            "user_id": user_id,
+            "name": name,
+            "username": username,
+            "message_count": message_count,
+        })
+    return result
+
+
+@router.callback_query(F.data.startswith("act:import:"))
+async def prepare_import(call: CallbackQuery, state: FSMContext):
+    chat_id = int(call.data.rsplit(":", 1)[1])
+    if not await _validate_selected_chat(call, state, chat_id, require_edit=True):
+        return
+    await state.set_state(ActivityStates.import_file)
+    await state.update_data(selected_chat_id=chat_id, chat_id=chat_id)
+    await call.message.answer(
+        "📥 <b>Импорт участников</b>\n\n"
+        "Отправьте файл <b>CSV</b> или <b>JSON</b>. Обязательное поле: <code>user_id</code>.\n"
+        "Дополнительные поля: <code>name</code>, <code>username</code>, <code>message_count</code>.\n\n"
+        "Бот проверит каждый ID через Telegram и добавит только участников выбранного чата. "
+        "Вышедшие и забаненные будут пропущены. Для отмены нажмите «◀️ Назад».",
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.message(ActivityStates.import_file, F.document)
+async def import_members_file(message: Message, state: FSMContext):
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    chat_id = int(data.get("chat_id", 0))
+    if not chat_id or not await _can_manage_chat(message.bot, message.from_user.id, chat_id):
+        await state.clear()
+        return await message.answer("⛔ Настройки этого чата защищены.")
+
+    document = message.document
+    filename = document.file_name or "members.csv"
+    if document.file_size and document.file_size > 10 * 1024 * 1024:
+        return await message.answer("Файл слишком большой. Максимальный размер — 10 МБ.")
+    buffer = io.BytesIO()
+    await message.bot.download(document, destination=buffer)
+    try:
+        rows = _normalise_import_rows(buffer.getvalue(), filename)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return await message.answer(f"Не удалось прочитать файл: {html.escape(str(exc))}")
+    if not rows:
+        return await message.answer("В файле не найдено ни одного корректного числового user_id.")
+    if len(rows) > 10000:
+        return await message.answer("За один импорт допускается не более 10 000 уникальных участников.")
+
+    progress = await message.answer(f"Проверяю через Telegram: 0 из {len(rows)}…")
+    added = 0
+    already_present = 0
+    skipped = 0
+    errors = 0
+    bots = 0
+    now_ts = int(time.time())
+
+    from db import get_chat_member_stats
+    try:
+        from members_panel import import_known_member
+    except Exception:
+        import_known_member = None
+
+    for index, row in enumerate(rows, start=1):
+        user_id = int(row["user_id"])
+        try:
+            member = await message.bot.get_chat_member(chat_id, user_id)
+            status = str(member.status)
+            if status in {"left", "kicked", "banned"}:
+                skipped += 1
+                continue
+            user = member.user
+            name = row["name"] or user.full_name or str(user_id)
+            username = row["username"] or user.username
+            existed = get_chat_member_stats(chat_id, user_id) is not None
+            import_member(chat_id, user_id, name, username, now_ts, row["message_count"])
+            if import_known_member:
+                import_known_member(chat_id, user_id, name, username, user.is_bot, row["message_count"])
+            bots += 1 if user.is_bot else 0
+            if existed:
+                already_present += 1
+            else:
+                added += 1
+        except Exception as exc:
+            errors += 1
+            if _BOTLOG:
+                await _BOTLOG(f"member import chat={chat_id} user={user_id} error: {exc}")
+        if index % 50 == 0:
+            try:
+                await progress.edit_text(f"Проверяю через Telegram: {index} из {len(rows)}…")
+            except Exception:
+                pass
+        # Ограничиваем темп запросов к Bot API.
+        await asyncio.sleep(0.035)
+
+    await state.clear()
+    await progress.edit_text(
+        "📥 <b>Импорт завершён</b>\n\n"
+        f"Строк с уникальными ID: <b>{len(rows)}</b>\n"
+        f"Добавлено новых: <b>{added}</b>\n"
+        f"Уже были, данные обновлены: <b>{already_present}</b>\n"
+        f"Не состоят в чате: <b>{skipped}</b>\n"
+        f"Ботов в добавленных/обновлённых: <b>{bots}</b>\n"
+        f"Ошибок Telegram API: <b>{errors}</b>\n\n"
+        "Участники без истории сообщений добавлены с нулевым счётчиком. "
+        "Ссылка на последнее сообщение появится после их первого нового сообщения.",
+        parse_mode="HTML",
+    )
+    await _show_settings(message, state, chat_id)
+
+
+@router.message(ActivityStates.import_file)
+async def import_requires_document(message: Message):
+    await message.answer("Отправьте документ в формате CSV или JSON либо нажмите «◀️ Назад».")
 
 
 @router.callback_query(F.data == "act:none")

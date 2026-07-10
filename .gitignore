@@ -4,3 +4,5 @@ __pycache__/
 .env
 bot.log
 *.log
+*.session
+*.session-journal

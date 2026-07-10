@@ -200,6 +200,28 @@ def record_member_join(
         conn.commit()
 
 
+
+def import_known_member(chat_id: int, user_id: int, name: str | None, username: str | None,
+                        is_bot: bool = False, message_count: int = 0):
+    """Добавляет участника из подтверждённого внешнего списка без увеличения счётчика сообщений."""
+    now = _now_ts()
+    with _connect() as conn:
+        conn.execute("""
+            INSERT INTO known_members(
+                chat_id, user_id, name, username, is_bot, first_seen_ts, last_seen_ts,
+                joined_at, left_at, message_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                name=COALESCE(excluded.name, known_members.name),
+                username=COALESCE(excluded.username, known_members.username),
+                is_bot=excluded.is_bot,
+                last_seen_ts=excluded.last_seen_ts,
+                left_at=NULL,
+                message_count=MAX(known_members.message_count, excluded.message_count)
+        """, (int(chat_id), int(user_id), name, username, 1 if is_bot else 0,
+              now, now, now, max(0, int(message_count or 0))))
+        conn.commit()
+
 def remove_known_member(chat_id: int, user_id: int):
     """Удаляет бывшего участника из списка известных участников."""
     with _connect() as conn:

@@ -216,6 +216,28 @@ def upsert_message_activity(chat_id: int, user_id: int, user_name: str, now_ts: 
         conn.commit()
 
 
+
+def import_member(chat_id: int, user_id: int, user_name: str | None, username: str | None,
+                  joined_at: int, message_count: int = 0):
+    """Добавляет подтверждённого участника из внешнего списка без искусственного сообщения."""
+    joined_at = max(0, int(joined_at))
+    message_count = max(0, int(message_count or 0))
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO chat_members(
+                chat_id, user_id, user_name, username, joined_at, left_at,
+                last_message_at, last_message_id, total_message_count, is_active
+            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, 1)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                user_name=COALESCE(excluded.user_name, chat_members.user_name),
+                username=COALESCE(excluded.username, chat_members.username),
+                joined_at=COALESCE(chat_members.joined_at, excluded.joined_at),
+                total_message_count=MAX(chat_members.total_message_count, excluded.total_message_count),
+                left_at=NULL,
+                is_active=1
+        """, (int(chat_id), int(user_id), user_name, username, joined_at, message_count))
+        conn.commit()
+
 def set_joined(chat_id: int, user_id: int, user_name: str, now_ts: int, username: str | None = None):
     with get_conn() as conn:
         conn.execute("""
